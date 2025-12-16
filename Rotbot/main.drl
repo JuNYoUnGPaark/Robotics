@@ -1,0 +1,102 @@
+#Home_pos = posj(0,0,90,0,90,0)
+Home_pos = posx(359, 42.64, 344.37, 148.29, -179.06, -61.2)
+movel(Home_pos, 50, 50)
+
+set_velj(50); set_accj(50); set_velx(50); set_accx(50)
+
+ABORT_DI = 5  # <- 여기 DI 번호
+
+def go_home_and_exit(sock, reason="ABORT"):
+    tp_log(reason + " -> stop & go home")
+    stop(DR_SSTOP)      # 진행 모션 정지(soft stop)
+    mwait(0)            # 모션 완전 정지까지 대기(권장)
+    movel(Home_pos, 50, 50)
+    # 필요하면 서버에 알림
+    try:
+        client_socket_write(sock, ("end\r\n").encode())
+    except:
+        pass
+
+def wait_motion_or_abort(sock):
+    # 비동기 모션이 끝날 때까지(BUSY->IDLE) 기다리면서 DI 감시
+    while True:
+        # 0.05초 단위로 DI 체크 (ON 되면 res=0)
+        res = wait_digital_input(ABORT_DI, ON, 0.05)
+        if res == 0:
+            go_home_and_exit(sock, "Digital input ON")
+            return False
+
+        # 모션 끝났으면 종료
+        st = check_motion()   # 0:IDLE, 1:INIT, 2:BUSY
+        if st == 0:
+            return True
+
+sock = client_socket_open("192.168.137.254", 200)
+
+while 1:
+    # 1) shot 요청
+    msg = "shot\r\n"
+    client_socket_write(sock, msg.encode())
+
+    data = client_socket_read(sock)
+    if (data == None) or (data[1] == None):
+        tp_log("Server closed (shot). Go Home.")
+        movel(Home_pos, 50, 50)
+        break
+
+    rx_data = data[1].decode().replace("\r\n", "")
+    rx_data_s = rx_data.split(",")
+
+    if len(rx_data_s) < 6:
+        tp_log("Invalid pose from server: " + rx_data)
+        movel(Home_pos, 50, 50)
+        break
+
+    x  = float(rx_data_s[0]); y  = float(rx_data_s[1]); z  = float(rx_data_s[2])
+    rx = float(rx_data_s[3]); ry = float(rx_data_s[4]); rz = float(rx_data_s[5])
+
+    target_pos = posx([x, y, z, rx, ry, rz])
+    q1, status = ikin(target_pos, 2, DR_BASE, ref_pos_opt=0)
+
+    delta = [0, 0, -100, 0, 0, 0]
+    approach_pos = trans(target_pos, delta, DR_TOOL)
+    q2, status = ikin(approach_pos, 2, DR_BASE, ref_pos_opt=0)
+
+    # ---- 1단계: 접근 (비동기) + DI 감시 ----
+    amovej(q2, vel=100, acc=100)
+    if wait_motion_or_abort(sock) == False:
+        break
+
+    # ---- 2단계: 타겟 (비동기) + DI 감시 ----
+    amovej(q1, vel=30, acc=30)
+    if wait_motion_or_abort(sock) == False:
+        break
+
+    # 2) reached 전송
+    msg = "reached\r\n"
+    client_socket_write(sock, msg.encode())
+
+    # 3) DONE 대기 (여기는 네 코드처럼 블로킹 read라서,
+    #    '대기 중에도' DI로 즉시 홈 복귀까지 하고 싶으면 별도 스레드/논블로킹 수신이 필요)
+    data_done = client_socket_read(sock)
+    if (data_done == None) or (data_done[1] == None):
+        tp_log("Server closed (DONE wait). Go Home.")
+        movel(Home_pos, 50, 50)
+        break
+
+    done_str = data_done[1].decode().replace("\r\n", "").strip().lower()
+
+    if done_str == "done":
+        # 주사 완료 후 다시 접근점으로 복귀(비동기+감시로 바꿔도 됨)
+        amovej(q2, vel=200, acc=200)
+        if wait_motion_or_abort(sock) == False:
+            break
+
+    elif done_str == "error" or done_str == "bye" or done_str == "end":
+        tp_log("Server finished or error: " + done_str + " -> Go Home.")
+        movel(Home_pos, 50, 50)
+        break
+    else:
+        tp_log("Unexpected msg from server: " + done_str + " -> Go Home.")
+        movel(Home_pos, 50, 50)
+        break
