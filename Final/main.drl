@@ -1,0 +1,251 @@
+# =========================================================
+# CONFIG
+# =========================================================
+#Home_pos = posj(0,0,90,0,90,0)
+Home_pos = posx(359, 42.64, 344.37, 148.29, -179.06, -61.2)
+
+ABORT_DI = 5
+
+FORCE_REF   = DR_TOOL
+FORCE_AXIS  = 2              # Fz
+
+# ---- Z방향 접촉 부호 (중요) ----
+# 눌렀을 때 Fz가 +로 커지면 +1, -로 커지면 -1
+CONTACT_SIGN = -1
+
+# ---- 접촉 감지 (하강 중) ----
+CONTACT_DELTA_TH = 8.0
+CONTACT_STOP_MODE = DR_SSTOP
+
+# ---- 소프트 터치(추가 눌림) ----
+PRESS_ENABLE = True
+PRESS_STEP_MM = 2.0
+PRESS_MAX_MM  = 2.0
+PRESS_VEL = 10
+PRESS_ACC = 10
+
+PRESS_TARGET_DELTA = 8.0
+PRESS_MAX_DELTA    = 15.0
+
+POLL_T = 0.01
+
+
+# =========================================================
+# UTILS
+# =========================================================
+def go_home_and_exit(sock, reason="ABORT"):
+    tp_log(reason + " -> stop & go home")
+    stop(DR_SSTOP)
+    mwait(0)
+    movel(Home_pos, 50, 50)
+    try:
+        client_socket_write(sock, ("end\r\n").encode())
+    except:
+        pass
+
+def read_force():
+    return get_tool_force(FORCE_REF)
+
+def force_delta_z_signed(f, f0):
+    # "눌림 방향"으로만 양수로 나오게 정렬
+    return (f[FORCE_AXIS] - f0[FORCE_AXIS]) * CONTACT_SIGN
+
+def wait_motion_or_abort(sock):
+    while True:
+        res = wait_digital_input(ABORT_DI, ON, 0.05)
+        if res == 0:
+            go_home_and_exit(sock, "Digital input ON")
+            return False
+
+        if check_motion() == 0:
+            return True
+
+        wait(POLL_T)
+
+def amovej_until_contact_or_done(sock, q_target, vel, acc, contact_delta_th):
+    """
+    Z방향(눌림 방향) 힘 변화가 threshold 이상일 때만 stop
+    return:
+      -1 : DI abort
+       0 : 목표까지 정상 도달(접촉 없이 완료)
+       1 : 접촉 감지로 중간 정지
+    """
+    f0 = read_force()
+    amovej(q_target, vel=vel, acc=acc)
+
+    while True:
+        # DI abort
+        res = wait_digital_input(ABORT_DI, ON, 0.05)
+        if res == 0:
+            go_home_and_exit(sock, "Digital input ON")
+            return -1
+
+        # contact check (Z방향 + 부호 조건)
+        f = read_force()
+        dFz = force_delta_z_signed(f, f0)
+        
+        if dFz >= PRESS_MAX_DELTA:
+            go_home_and_exit(sock,"OVER FORCE during q1 move: dFz=" + str(dFz))
+            return -1
+
+        # ✅ "눌림 방향"으로 dFz가 커질 때만 멈춤
+        if dFz >= contact_delta_th:
+            stop(CONTACT_STOP_MODE)
+            mwait(0)
+            return 1
+
+        # motion done
+        if check_motion() == 0:
+            return 0
+
+        wait(POLL_T)
+
+def soft_touch_press(sock):
+    """
+    소프트터치도 Z방향(눌림방향) 힘이 threshold 넘을 때만 성공 처리
+    movel -> amovel 유지
+    """
+    if not PRESS_ENABLE:
+        return True
+
+    f0 = read_force()
+    steps = int(PRESS_MAX_MM / PRESS_STEP_MM)
+
+    for i in range(steps):
+        # DI abort
+        res = wait_digital_input(ABORT_DI, ON, 0.0)
+        if res == 0:
+            go_home_and_exit(sock, "Digital input ON during soft-touch")
+            return False
+
+        f = read_force()
+        dFz = force_delta_z_signed(f, f0)
+
+        # 과압 보호(눌림 방향만 검사)
+        if dFz >= PRESS_MAX_DELTA:
+            go_home_and_exit(sock, "Over-force during soft-touch: dFz=" + str(dFz))
+            return False
+
+        # 목표 접촉이면 종료(눌림 방향만)
+        if dFz >= PRESS_TARGET_DELTA:
+            return True
+
+        # 0.5mm 추가 눌림 (현재 너 코드대로)
+        amovel([0, 0, PRESS_STEP_MM, 0, 0, 0],
+               vel=PRESS_VEL, acc=PRESS_ACC,
+               ref=DR_TOOL, mod=DR_MV_MOD_REL)
+
+        # 비동기 스텝 완료 대기
+        while True:
+            if check_motion() == 0:
+                break
+            wait(POLL_T)
+
+    return True
+
+def parse_pose(rx_data):
+    rx_data = rx_data.replace("\r\n", "")
+    s = rx_data.split(",")
+    if len(s) < 6:
+        return None
+    x  = float(s[0]); y  = float(s[1]); z  = float(s[2])
+    rx = float(s[3]); ry = float(s[4]); rz = float(s[5])
+    return [x,y,z,rx,ry,rz]
+
+
+# =========================================================
+# MAIN
+# =========================================================
+movel(Home_pos, 50, 50)
+set_velj(50); set_accj(50); set_velx(50); set_accx(50)
+
+sock = client_socket_open("192.168.137.254", 200)
+
+while 1:
+    msg = "shot\r\n"
+    client_socket_write(sock, msg.encode())
+
+    data = client_socket_read(sock)
+    if (data == None) or (data[1] == None):
+        tp_log("Server closed (shot). Go Home.")
+        movel(Home_pos, 50, 50)
+        break
+
+    rx_data = data[1].decode()
+    pose6 = parse_pose(rx_data)
+    if pose6 == None:
+        tp_log("Invalid pose from server: " + rx_data)
+        movel(Home_pos, 50, 50)
+        break
+
+    target_pos = posx(pose6)
+
+    # IK (+10mm 보정 유지)
+    '''
+    delta2 = [0, 0, -8, 0, 0, 0]
+    target_pos2 = trans(target_pos, delta2, DR_TOOL)
+    
+    
+    q1, status = ikin(target_pos2, 2, DR_BASE, ref_pos_opt=0)
+    
+    '''
+    q1, status = ikin(target_pos, 2, DR_BASE, ref_pos_opt=0)
+    
+    
+    if status != 0:
+        tp_log("IK fail (target). Go Home.")
+        movel(Home_pos, 50, 50)
+        break
+
+    # approach
+    delta = [0, 0, -100, 0, 0, 0]
+    approach_pos = trans(target_pos, delta, DR_TOOL)
+
+    q2, status = ikin(approach_pos, 2, DR_BASE, ref_pos_opt=0)
+    if status != 0:
+        tp_log("IK fail (approach). Go Home.")
+        movel(Home_pos, 50, 50)
+        break
+
+    # 1단계: 접근
+    amovej(q2, vel=100, acc=100)
+    if wait_motion_or_abort(sock) == False:
+        break
+
+    # 2단계: 하강 중 Z방향 압력만 감지해서 stop
+    ret = amovej_until_contact_or_done(sock, q1, vel=3, acc=3, contact_delta_th=CONTACT_DELTA_TH)
+    if ret == -1:
+        break
+
+    # 소프트 터치도 Z방향 압력만 기준으로
+    ok = soft_touch_press(sock)
+    if ok == False:
+        break
+
+    # 주사 트리거
+    msg = "reached\r\n"
+    client_socket_write(sock, msg.encode())
+
+    # DONE/ERROR 대기
+    data_done = client_socket_read(sock)
+    if (data_done == None) or (data_done[1] == None):
+        tp_log("Server closed (DONE wait). Go Home.")
+        movel(Home_pos, 50, 50)
+        break
+
+    done_str = data_done[1].decode().replace("\r\n", "").strip().lower()
+
+    if done_str == "done":
+        amovej(q2, vel=200, acc=200)
+        if wait_motion_or_abort(sock) == False:
+            break
+
+    elif done_str == "error" or done_str == "bye" or done_str == "end":
+        tp_log("Server finished or error: " + done_str + " -> Go Home.")
+        movel(Home_pos, 50, 50)
+        break
+
+    else:
+        tp_log("Unexpected msg from server: " + done_str + " -> Go Home.")
+        movel(Home_pos, 50, 50)
+        break
